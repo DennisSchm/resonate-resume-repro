@@ -1,10 +1,9 @@
-# Resonate workflow-resume repro
+# Resonate worker-crash resume repro
 
-A workflow that the host process exits *during execution* — after the
-SDK has called `ctx.run` and before the workflow function returns —
-cannot be resumed. Calling `resonate.run(id, ...)` again with the same
-RUN_ID, while the original run is still booked on the server, fails
-with:
+A `#[resonate::function]` whose worker exits before it returns cannot
+be re-issued with the same id while the original run is still booked
+on the server. The second `resonate.run(id, …)` call hangs briefly,
+then fails with:
 
 ```
 Error: DecodingError("missing 'promise' in response")
@@ -17,7 +16,8 @@ Verified against:
 
 ## Reproduce
 
-One terminal — start a fresh server:
+One terminal — fresh server every attempt (the `--rm` matters; see
+note below):
 
 ```sh
 docker run --rm -p 8001:8001 ghcr.io/resonatehq/resonate:v0.9.4 \
@@ -27,53 +27,60 @@ docker run --rm -p 8001:8001 ghcr.io/resonatehq/resonate:v0.9.4 \
 Another terminal:
 
 ```sh
-cargo run -- crash    # workflow exits 137 after ctx.run, before returning
-cargo run -- replay   # same RUN_ID; expected to resume and print "workflow(step(first))"
+cargo run -- crash    # task exits 137 before returning
+cargo run -- replay   # same id; expected to resume and print OK
 ```
 
 ### Expected
 
 ```
-[replay] OK: workflow(step(first))
+[replay] OK: done
 ```
 
 ### Observed
 
 ```
-[replay] resonate.run("repro", crash=false)
+[crash]  resonate.run("repro", task, true)
+[CRASH] exit(137) before task returns
+
+[replay] resonate.run("repro", task, false)
 Error: DecodingError("missing 'promise' in response")
 ```
 
-The decoding error is downstream of a 409 from the server.
+> **Re-running:** restart the docker server (`Ctrl-C` then re-run the
+> `docker run` command) between attempts. With `--rm` this gives a
+> clean slate; without it, server-side state from prior runs cycles
+> the task through `task.acquire` / `Task released back to pending`
+> and the SDK occasionally re-runs the cached invocation instead of
+> surfacing the decoding error. The bug is the same either way, but
+> the decoding-error symptom is what's worth showing.
 
 ## Server-log evidence
 
-The server's view of the two runs (irrelevant lines elided):
-
 ```
-# run 1 — crash
-Promise created   promise_id=repro.0   state=pending      ← child promise for the ctx.run leaf
-Promise settled   promise_id=repro.0   state=resolved     ← leaf finished, correctly resolved
-[host process exit(137); workflow function never returned]
+# run 1 (crash)
+Received request  kind=task.create   corr_id=…  status=200          ← worker books the task
+[host process exit(137); task never marked complete]
 
-# run 2 — replay (immediately after)
-Received request  kind=task.create  corr_id=sr-…
-Request rejected  kind=task.create  status=409  elapsed_ms=0
+# run 2 (replay), issued seconds later
+Received request  kind=task.create   corr_id=…
+Request rejected  kind=task.create   status=409   elapsed_ms=0      ← original task still booked
 ```
 
-After the crash, the workflow's task is still booked on the server
-(versioned and cycled by `task.acquire` / `Task released back to
-pending` until its TTL expires). The replay's fresh `task.create`
-collides with that booking and gets 409. The SDK then surfaces the
-409 body to the caller as `DecodingError("missing 'promise' in
-response")`.
+The SDK then surfaces the 409 body to the caller as
+`DecodingError("missing 'promise' in response")`.
 
 ## Why this matters
 
 Durable-execution's headline guarantee is "if the worker dies
 mid-flow, replay with the same id picks up where it left off." On
-this SDK + server pair, an immediate replay (within the task TTL
-window) is rejected before it can reach the cached step.
+this SDK + server pair, an immediate replay (within the original
+task's TTL window) is rejected before it can reach a useful state.
+
+Notably, the bug **does not require `ctx.run`** — it surfaces with a
+pure leaf function that exits before returning. So it isn't a
+checkpoint-resume issue; it's a task-lifecycle issue around a worker
+that dropped a booked task without completing it.
 
 Two possibilities I haven't sorted out:
 
@@ -89,29 +96,23 @@ protocol/encoding fixes:
 - SDK 0.1.0 → 0.3.0 ("Fix protocol version and subclient encodings")
 - server 0.9.3 → 0.9.4 ("Linearizability and version-only-on-claim fixes")
 
-Same symptom on the latest of each. Either I missed the right
-release notes, or the gap is somewhere else entirely.
+Same symptom on the latest of each.
 
 ## Files
 
 - `Cargo.toml` — three deps: `resonate-sdk = "0.3.0"`, `tokio`, `serde`.
-- `src/main.rs` — ~45 lines. One leaf, one workflow with one `ctx.run`,
-  a `crash`/`replay` CLI driver.
+- `src/main.rs` — **27 lines**. One leaf, one `crash`/`replay` CLI mode,
+  no workflow, no `ctx.run`, no extra structs.
 
-The workflow body in full:
+The whole task in full:
 
 ```rust
 #[resonate::function]
-async fn workflow(ctx: &resonate::prelude::Context, crash: bool) -> Result<String> {
-    let s: String = ctx.run(step, "first".to_string()).await?;
+async fn task(crash: bool) -> Result<String> {
     if crash {
-        eprintln!("[CRASH] exit(137) after ctx.run, before workflow returns");
+        eprintln!("[CRASH] exit(137) before task returns");
         std::process::exit(137);
     }
-    Ok(format!("workflow({s})"))
+    Ok("done".into())
 }
 ```
-
-`step` is pure — `Ok(format!("step({value})"))`. No I/O, no app
-logic. The bug is entirely in the SDK ↔ server task lifecycle around
-a partially-executed workflow.

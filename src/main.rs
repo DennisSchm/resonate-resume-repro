@@ -1,22 +1,15 @@
-//! Minimal repro: a workflow that exits after `ctx.run` returns but
-//! before the workflow function returns cannot be resumed.
-//! See README.md.
+//! Minimal repro: a `#[resonate::function]` whose worker exits before
+//! it returns cannot be re-issued with the same id. See README.md.
 
 use resonate::prelude::{Resonate, ResonateConfig, Result};
 
 #[resonate::function]
-async fn step(value: String) -> Result<String> {
-    Ok(format!("step({value})"))
-}
-
-#[resonate::function]
-async fn workflow(ctx: &resonate::prelude::Context, crash: bool) -> Result<String> {
-    let s: String = ctx.run(step, "first".to_string()).await?;
+async fn task(crash: bool) -> Result<String> {
     if crash {
-        eprintln!("[CRASH] exit(137) after ctx.run, before workflow returns");
+        eprintln!("[CRASH] exit(137) before task returns");
         std::process::exit(137);
     }
-    Ok(format!("workflow({s})"))
+    Ok("done".into())
 }
 
 #[tokio::main]
@@ -35,11 +28,9 @@ async fn main() -> Result<()> {
         url: Some("http://localhost:8001".into()),
         ..Default::default()
     });
-    r.register(step)?;
-    r.register(workflow)?;
+    r.register(task)?;
 
-    println!("[{mode}] resonate.run(\"repro\", crash={crash})");
-    let result: String = r.run("repro", workflow, crash).await?;
+    let result: String = r.run("repro", task, crash).await?;
     println!("[{mode}] OK: {result}");
 
     r.stop().await?;
