@@ -1,5 +1,11 @@
 # Resonate worker-crash resume repro
 
+> **Status: fixed upstream in `resonate-sdk` 0.4.0.** This repo is kept
+> as the historical reproducer that drove the fix. `Cargo.toml` is
+> pinned to `0.4`; `cargo run -- crash && cargo run -- replay` against
+> `ghcr.io/resonatehq/resonate:v0.9.4` now prints `[replay] OK: done`
+> instead of surfacing `DecodingError`.
+
 A `#[resonate::function]` whose worker exits before it returns cannot
 be re-issued with the same id while the original run is still booked
 on the server. The second `resonate.run(id, …)` call hangs briefly,
@@ -9,9 +15,10 @@ then fails with:
 Error: DecodingError("missing 'promise' in response")
 ```
 
-Verified against:
+Originally observed against:
 
-- `resonate-sdk` **0.3.0** (crates.io)
+- `resonate-sdk` **0.3.0** (crates.io) — broken
+- `resonate-sdk` **0.4.0** (crates.io) — fixed
 - `resonate` server **0.9.4** (`ghcr.io/resonatehq/resonate:v0.9.4`)
 
 ## Reproduce

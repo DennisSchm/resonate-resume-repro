@@ -5,6 +5,6 @@ edition = "2021"
 publish = false
 
 [dependencies]
-resonate = { version = "0.3.0", package = "resonate-sdk" }
+resonate = { version = "0.4", package = "resonate-sdk" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
